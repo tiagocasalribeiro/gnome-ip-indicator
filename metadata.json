@@ -1,0 +1,8 @@
+{
+  "name": "IP Indicator",
+  "description": "Displays your local and public IP addresses on the top panel, with real-time network state monitoring.",
+  "uuid": "ip-indicator@tiagocasalribeiro.github.io",
+  "shell-version": ["45", "46", "47", "48"],
+  "version": 1,
+  "url": "https://github.com/tiagocasalribeiro/ip-indicator"
+}
