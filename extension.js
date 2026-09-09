@@ -3,12 +3,12 @@ import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
 import Soup from 'gi://Soup?version=3.0';
 import NM from 'gi://NM';
+import Gio from 'gi://Gio';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 export default class IpIndicatorExtension extends Extension {
     enable() {
-        // Create the main container box with native panel button styling
         this._box = new St.BoxLayout({
             style_class: 'panel-button',
             y_align: Clutter.ActorAlign.CENTER,
@@ -17,7 +17,6 @@ export default class IpIndicatorExtension extends Extension {
             x_expand: false
         });
 
-        // Labels with fixed minimum width to prevent UI flashing during updates
         this._publicIpLabel = new St.Label({ 
             text: "Public: ...", 
             y_align: Clutter.ActorAlign.CENTER,
@@ -41,15 +40,12 @@ export default class IpIndicatorExtension extends Extension {
         this._box.add_child(this._separator);
         this._box.add_child(this._localIpLabel);
 
-        // Insert into the left panel box, right after the "Activities" button (index 1)
         Main.panel._leftBox.insert_child_at_index(this._box, 1);
 
-        // Track last known values to avoid unnecessary UI updates
         this._lastPublicIp = '';
         this._lastLocalIp = '';
         this._pendingMessage = null;
 
-        // Initialize NetworkManager client to monitor connection state
         try {
             this._nmClient = NM.Client.new(null);
             this._nmStateId = this._nmClient.connect('notify::state', () => {
@@ -59,11 +55,9 @@ export default class IpIndicatorExtension extends Extension {
             console.log(`[IP Indicator] Failed to initialize NM Client: ${e}`);
         }
 
-        // Initial fetch
         this._updateLocalIp();
         this._updatePublicIp();
 
-        // Fallback timer to update every 60 seconds
         this._timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 60, () => {
             this._updateLocalIp();
             this._updatePublicIp();
@@ -72,16 +66,16 @@ export default class IpIndicatorExtension extends Extension {
     }
 
     disable() {
-        // Clean up timer
+        // 1. Limpar temporizador
         if (this._timeoutId) {
             GLib.source_remove(this._timeoutId);
             this._timeoutId = null;
         }
         
-        // Cancel any pending HTTP requests
+        // 2. Cancelar pedidos de rede pendentes
         this._cancelPendingRequest();
         
-        // Disconnect NetworkManager signals
+        // 3. Desligar sinais do NetworkManager
         if (this._nmClient) {
             if (this._nmStateId) {
                 this._nmClient.disconnect(this._nmStateId);
@@ -89,7 +83,19 @@ export default class IpIndicatorExtension extends Extension {
             this._nmClient = null;
         }
         
-        // Destroy UI elements
+        // 4. Destruir e libertar explicitamente todos os objetos criados (Corrige EGO-L-002 e EGO-L-005)
+        if (this._localIpLabel) {
+            this._localIpLabel.destroy();
+            this._localIpLabel = null;
+        }
+        if (this._separator) {
+            this._separator.destroy();
+            this._separator = null;
+        }
+        if (this._publicIpLabel) {
+            this._publicIpLabel.destroy();
+            this._publicIpLabel = null;
+        }
         if (this._box) {
             this._box.destroy();
             this._box = null;
@@ -101,7 +107,7 @@ export default class IpIndicatorExtension extends Extension {
             try {
                 this._pendingMessage.cancel();
             } catch (e) {
-                // Ignore cancellation errors
+                // Ignorar erros de cancelamento
             }
             this._pendingMessage = null;
         }
@@ -111,11 +117,9 @@ export default class IpIndicatorExtension extends Extension {
         const state = this._nmClient.get_state();
         
         if (state === NM.State.CONNECTED_GLOBAL) {
-            // Network connected: fetch fresh IPs
             this._updateLocalIp();
             this._updatePublicIp();
         } else {
-            // Network disconnected: cancel pending requests and show 0.0.0.0
             this._cancelPendingRequest();
             this._setLocalIpText('Local: 0.0.0.0');
             this._setPublicIpText('Public: 0.0.0.0');
@@ -142,18 +146,32 @@ export default class IpIndicatorExtension extends Extension {
             return;
         }
 
+        // Usar Gio.Subprocess assíncrono em vez de GLib.spawn_command_line_sync (Corrige EGO-X-002)
+        const proc = new Gio.Subprocess({
+            argv: ['hostname', '-I'],
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        });
+        
         try {
-            const [success, out] = GLib.spawn_command_line_sync('hostname -I');
-            if (success && out) {
-                let ip = out.toString().trim().split(' ')[0];
-                if (!ip || ip === '') {
-                    ip = '0.0.0.0';
+            proc.init(null);
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                try {
+                    const [success, stdout, stderr] = proc.communicate_utf8_finish(res);
+                    if (success && stdout) {
+                        let ip = stdout.trim().split(' ')[0];
+                        if (!ip || ip === '') {
+                            ip = '0.0.0.0';
+                        }
+                        this._setLocalIpText(`Local: ${ip}`);
+                    } else {
+                        this._setLocalIpText('Local: 0.0.0.0');
+                    }
+                } catch (e) {
+                    this._setLocalIpText('Local: 0.0.0.0');
                 }
-                this._setLocalIpText(`Local: ${ip}`);
-            } else {
-                this._setLocalIpText('Local: 0.0.0.0');
-            }
+            });
         } catch (e) {
+            console.log(`[IP Indicator] Failed to spawn hostname: ${e}`);
             this._setLocalIpText('Local: 0.0.0.0');
         }
     }
@@ -164,7 +182,6 @@ export default class IpIndicatorExtension extends Extension {
             return;
         }
 
-        // Cancel any previous pending request before starting a new one
         this._cancelPendingRequest();
         this._setPublicIpText('Public: ...');
 
@@ -173,7 +190,6 @@ export default class IpIndicatorExtension extends Extension {
         const currentMessage = this._pendingMessage;
         
         session.send_and_read_async(currentMessage, GLib.PRIORITY_DEFAULT, null, (session, result) => {
-            // Double-check network state in case it changed while the request was in flight
             if (this._nmClient && this._nmClient.get_state() !== NM.State.CONNECTED_GLOBAL) {
                 this._setPublicIpText('Public: 0.0.0.0');
                 return;
@@ -187,7 +203,6 @@ export default class IpIndicatorExtension extends Extension {
             } catch (e) {
                 this._setPublicIpText('Public: 0.0.0.0');
             } finally {
-                // Clean up reference if this is still the active message
                 if (this._pendingMessage === currentMessage) {
                     this._pendingMessage = null;
                 }
