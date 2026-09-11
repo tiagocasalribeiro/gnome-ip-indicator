@@ -1,8 +1,9 @@
 {
   "name": "IP Indicator",
-  "description": "Displays your local and public IP addresses on the top panel, with real-time network state monitoring.",
+  "description": "Displays your local and public IP addresses on the top panel, with real-time network state monitoring and interface carousel.",
   "uuid": "ip-indicator@tiagocasalribeiro.github.io",
   "shell-version": ["45", "46", "47", "48"],
-  "version": 4,
-  "url": "https://github.com/tiagocasalribeiro/ip-indicator"
+  "version": 5,
+  "url": "https://github.com/tiagocasalribeiro/ip-indicator",
+  "settings-schema": "org.gnome.shell.extensions.ip-indicator"
 }

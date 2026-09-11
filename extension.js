@@ -32,7 +32,7 @@ export default class IpIndicatorExtension extends Extension {
             text: "Local: ...", 
             y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.START,
-            style: 'min-width: 200px;'
+            style: 'min-width: 260px;' // Aumentado para acomodar nomes como "enp0s31f6.4094"
         });
 
         this._box.add_child(this._publicIpLabel);
@@ -45,17 +45,17 @@ export default class IpIndicatorExtension extends Extension {
         this._lastLocalIp = '';
         this._pendingMessage = null;
         
-        this._isVlanActive = false;
-        this._activeVlanId = null;
-        
         this._isUpdating = false;
         this._updateQueue = [];
         this._refreshTimeoutId = null;
-        this._retryLocalId = null;
         this._retryPublicId = null;
         this._startupRetryIds = [];
         this._deviceIp4Ids = new Map();
         this._idleSourceId = null;
+        this._rotationTimeoutId = null;
+        this._rotationIndex = 0;
+        this._interfacesList = [];
+        
         this._nmClient = null;
         this._nmStateId = null;
         this._nmActiveId = null;
@@ -67,6 +67,7 @@ export default class IpIndicatorExtension extends Extension {
                 this._setupSignals();
                 this._scheduleRefresh();
                 this._startStartupPolling();
+                this._startRotation();
             } catch (e) {
                 console.log(`[IP Indicator] NM Client async init failed: ${e}`);
             }
@@ -94,12 +95,14 @@ export default class IpIndicatorExtension extends Extension {
         this._nmActiveId = this._nmClient.connect('notify::active-connections', () => {
             this._monitorDevicesIp4();
             this._scheduleRefresh();
+            this._rebuildInterfacesList();
         });
         
         this._monitorDevicesIp4();
         
         this._timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 30, () => {
             this._scheduleRefresh();
+            this._rebuildInterfacesList();
             return GLib.SOURCE_CONTINUE;
         });
     }
@@ -116,9 +119,89 @@ export default class IpIndicatorExtension extends Extension {
         for (const device of devices) {
             const signalId = device.connect('notify::ip4-config', () => {
                 this._scheduleRefresh();
+                this._rebuildInterfacesList();
             });
             this._deviceIp4Ids.set(device, signalId);
         }
+    }
+
+    // Constrói a lista de todas as interfaces com IP válido
+    // O nome da interface já inclui o sufixo VLAN (ex: eth0.10, enp0s31f6.50)
+    _rebuildInterfacesList() {
+        if (!this._nmClient || this._nmClient.get_state() !== NM.State.CONNECTED_GLOBAL) {
+            this._interfacesList = [];
+            return;
+        }
+
+        const newInterfaces = [];
+        const devices = this._nmClient.get_devices() || [];
+        
+        for (const device of devices) {
+            const ip4Config = device.get_ip4_config();
+            if (!ip4Config) continue;
+            
+            const addresses = ip4Config.get_addresses();
+            if (!addresses || addresses.length === 0) continue;
+            
+            const ip = addresses[0].get_address();
+            if (!ip || ip === '0.0.0.0') continue;
+            
+            // get_iface() já devolve o nome completo: "eth0" ou "eth0.10" para VLANs
+            const ifaceName = device.get_iface();
+            if (!ifaceName) continue;
+            
+            // Detetar VLAN pelo tipo de dispositivo (mais fiável que pelo nome)
+            const isVlan = device.get_device_type() === NM.DeviceType.VLAN;
+            
+            newInterfaces.push({
+                name: ifaceName,
+                ip: ip,
+                isVlan: isVlan
+            });
+        }
+
+        // Ordenar: VLANs primeiro, depois por nome
+        newInterfaces.sort((a, b) => {
+            if (a.isVlan && !b.isVlan) return -1;
+            if (!a.isVlan && b.isVlan) return 1;
+            return a.name.localeCompare(b.name);
+        });
+
+        // Só atualizar se a lista realmente mudou
+        const oldKey = JSON.stringify(this._interfacesList);
+        const newKey = JSON.stringify(newInterfaces);
+        if (oldKey !== newKey) {
+            this._interfacesList = newInterfaces;
+            this._rotationIndex = 0;
+            this._updateLocalIpDisplay();
+        }
+    }
+
+    _startRotation() {
+        if (this._rotationTimeoutId) {
+            GLib.source_remove(this._rotationTimeoutId);
+        }
+        // Ciclar a cada 5 segundos
+        this._rotationTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
+            if (this._interfacesList.length > 1) {
+                this._rotationIndex = (this._rotationIndex + 1) % this._interfacesList.length;
+                this._updateLocalIpDisplay();
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _updateLocalIpDisplay() {
+        if (this._interfacesList.length === 0) {
+            this._setLocalIpText('Local: 0.0.0.0');
+            return;
+        }
+
+        const current = this._interfacesList[this._rotationIndex % this._interfacesList.length];
+        
+        // Formato unificado: Local: [nome-interface] ip
+        // Exemplos: "Local: [eth0] 192.168.1.10" ou "Local: [eth0.10] 192.168.50.10"
+        this._setLocalIpText(`Local: [${current.name}] ${current.ip}`);
     }
 
     disable() {
@@ -132,11 +215,6 @@ export default class IpIndicatorExtension extends Extension {
             this._refreshTimeoutId = null;
         }
         
-        if (this._retryLocalId) {
-            GLib.source_remove(this._retryLocalId);
-            this._retryLocalId = null;
-        }
-        
         if (this._retryPublicId) {
             GLib.source_remove(this._retryPublicId);
             this._retryPublicId = null;
@@ -145,6 +223,11 @@ export default class IpIndicatorExtension extends Extension {
         if (this._idleSourceId) {
             GLib.source_remove(this._idleSourceId);
             this._idleSourceId = null;
+        }
+        
+        if (this._rotationTimeoutId) {
+            GLib.source_remove(this._rotationTimeoutId);
+            this._rotationTimeoutId = null;
         }
         
         for (const id of this._startupRetryIds) {
@@ -221,23 +304,18 @@ export default class IpIndicatorExtension extends Extension {
         if (state !== NM.State.CONNECTED_GLOBAL) {
             this._cancelPendingRequest();
             this._cancelRetries();
-            this._isVlanActive = false;
-            this._activeVlanId = null;
+            this._interfacesList = [];
             this._setLocalIpText('Local: 0.0.0.0');
             this._setPublicIpText('Public: 0.0.0.0');
             return;
         }
 
-        this._updateNetworkInfo();
-        this._updateLocalIp();
+        this._rebuildInterfacesList();
+        this._updateLocalIpDisplay();
         this._updatePublicIp();
     }
 
     _cancelRetries() {
-        if (this._retryLocalId) {
-            GLib.source_remove(this._retryLocalId);
-            this._retryLocalId = null;
-        }
         if (this._retryPublicId) {
             GLib.source_remove(this._retryPublicId);
             this._retryPublicId = null;
@@ -255,90 +333,6 @@ export default class IpIndicatorExtension extends Extension {
         if (newText !== this._lastPublicIp) {
             this._publicIpLabel.set_text(newText);
             this._lastPublicIp = newText;
-        }
-    }
-
-    _getActiveLocalIp() {
-        if (!this._nmClient || this._nmClient.get_state() !== NM.State.CONNECTED_GLOBAL) {
-            return '0.0.0.0';
-        }
-
-        let targetAc = null;
-        const activeConnections = this._nmClient.get_active_connections() || [];
-
-        const vlanConns = activeConnections.filter(ac => 
-            ac && ac.connection && ac.connection.is_type(NM.SETTING_VLAN_SETTING_NAME)
-        );
-
-        if (vlanConns.length > 0) {
-            targetAc = vlanConns[0];
-        } else {
-            targetAc = this._nmClient.get_primary_connection();
-        }
-
-        if (!targetAc) return '0.0.0.0';
-
-        const devices = targetAc.get_devices() || [];
-        if (devices.length === 0) return '0.0.0.0';
-
-        const device = devices[0];
-        const ip4Config = device.get_ip4_config();
-
-        if (!ip4Config) return '0.0.0.0';
-
-        const addresses = ip4Config.get_addresses();
-        if (addresses && addresses.length > 0) {
-            return addresses[0].get_address();
-        }
-
-        return '0.0.0.0';
-    }
-
-    _updateNetworkInfo() {
-        if (!this._nmClient || this._nmClient.get_state() !== NM.State.CONNECTED_GLOBAL) {
-            this._isVlanActive = false;
-            this._activeVlanId = null;
-            return;
-        }
-
-        this._isVlanActive = false;
-        this._activeVlanId = null;
-
-        const activeConnections = this._nmClient.get_active_connections() || [];
-        
-        const vlanConns = activeConnections.filter(ac => 
-            ac && ac.connection && ac.connection.is_type(NM.SETTING_VLAN_SETTING_NAME)
-        );
-
-        if (vlanConns.length > 0) {
-            this._isVlanActive = true;
-            const vlanAc = vlanConns[0]; 
-            const vlanConn = vlanAc.get_connection();
-            const vlanSetting = vlanConn.get_setting_vlan();
-            
-            this._activeVlanId = vlanSetting ? vlanSetting.get_id() : null;
-        }
-    }
-
-    _updateLocalIp() {
-        const ip = this._getActiveLocalIp();
-        
-        let prefix = 'Local: ';
-        if (this._isVlanActive && this._activeVlanId !== null) {
-            prefix = `Local: [${this._activeVlanId}] `;
-        }
-        
-        this._setLocalIpText(`${prefix}${ip}`);
-        
-        if (ip === '0.0.0.0' && 
-            this._nmClient && 
-            this._nmClient.get_state() === NM.State.CONNECTED_GLOBAL &&
-            !this._retryLocalId) {
-            this._retryLocalId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
-                this._retryLocalId = null;
-                this._scheduleRefresh();
-                return GLib.SOURCE_REMOVE;
-            });
         }
     }
 
