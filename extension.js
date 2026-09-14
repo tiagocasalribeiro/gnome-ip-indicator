@@ -1,7 +1,7 @@
 import St from 'gi://St';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
-import Soup from 'gi://Soup?version=3.0';
+import Gio from 'gi://Gio';
 import NM from 'gi://NM';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -16,39 +16,22 @@ export default class IpIndicatorExtension extends Extension {
             x_expand: false
         });
 
-        this._publicIpLabel = new St.Label({ 
-            text: "Public: ...", 
+        this._displayLabel = new St.Label({ 
+            text: "Loading...", 
             y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.START,
-            style: 'min-width: 160px;'
-        });
-        
-        this._separator = new St.Label({ 
-            text: " | ", 
-            y_align: Clutter.ActorAlign.CENTER 
-        });
-        
-        this._localIpLabel = new St.Label({ 
-            text: "Local: ...", 
-            y_align: Clutter.ActorAlign.CENTER,
-            x_align: Clutter.ActorAlign.START,
-            style: 'min-width: 260px;' // Aumentado para acomodar nomes como "enp0s31f6.4094"
+            style: 'min-width: 400px;'
         });
 
-        this._box.add_child(this._publicIpLabel);
-        this._box.add_child(this._separator);
-        this._box.add_child(this._localIpLabel);
-
+        this._box.add_child(this._displayLabel);
         Main.panel._leftBox.insert_child_at_index(this._box, 1);
 
-        this._lastPublicIp = '';
-        this._lastLocalIp = '';
-        this._pendingMessage = null;
+        this._lastDisplayText = '';
+        this._pendingProcesses = new Map();
         
         this._isUpdating = false;
         this._updateQueue = [];
         this._refreshTimeoutId = null;
-        this._retryPublicId = null;
         this._startupRetryIds = [];
         this._deviceIp4Ids = new Map();
         this._idleSourceId = null;
@@ -125,11 +108,11 @@ export default class IpIndicatorExtension extends Extension {
         }
     }
 
-    // Constrói a lista de todas as interfaces com IP válido
-    // O nome da interface já inclui o sufixo VLAN (ex: eth0.10, enp0s31f6.50)
     _rebuildInterfacesList() {
         if (!this._nmClient || this._nmClient.get_state() !== NM.State.CONNECTED_GLOBAL) {
             this._interfacesList = [];
+            this._cancelAllPendingProcesses();
+            this._updateDisplay();
             return;
         }
 
@@ -146,62 +129,154 @@ export default class IpIndicatorExtension extends Extension {
             const ip = addresses[0].get_address();
             if (!ip || ip === '0.0.0.0') continue;
             
-            // get_iface() já devolve o nome completo: "eth0" ou "eth0.10" para VLANs
             const ifaceName = device.get_iface();
             if (!ifaceName) continue;
             
-            // Detetar VLAN pelo tipo de dispositivo (mais fiável que pelo nome)
             const isVlan = device.get_device_type() === NM.DeviceType.VLAN;
+            
+            const existingEntry = this._interfacesList.find(e => e.name === ifaceName);
+            const publicIp = existingEntry ? existingEntry.publicIp : null;
             
             newInterfaces.push({
                 name: ifaceName,
                 ip: ip,
-                isVlan: isVlan
+                isVlan: isVlan,
+                publicIp: publicIp
             });
         }
 
-        // Ordenar: VLANs primeiro, depois por nome
         newInterfaces.sort((a, b) => {
             if (a.isVlan && !b.isVlan) return -1;
             if (!a.isVlan && b.isVlan) return 1;
             return a.name.localeCompare(b.name);
         });
 
-        // Só atualizar se a lista realmente mudou
-        const oldKey = JSON.stringify(this._interfacesList);
-        const newKey = JSON.stringify(newInterfaces);
+        const oldKey = JSON.stringify(this._interfacesList.map(e => ({name: e.name, ip: e.ip, isVlan: e.isVlan})));
+        const newKey = JSON.stringify(newInterfaces.map(e => ({name: e.name, ip: e.ip, isVlan: e.isVlan})));
+        
         if (oldKey !== newKey) {
             this._interfacesList = newInterfaces;
             this._rotationIndex = 0;
-            this._updateLocalIpDisplay();
+            
+            this._updateDisplay();
+            this._fetchAllPublicIps();
         }
+    }
+
+    _fetchAllPublicIps() {
+        const currentNames = new Set(this._interfacesList.map(e => e.name));
+        for (const [name, proc] of this._pendingProcesses) {
+            if (!currentNames.has(name)) {
+                try { proc.force_exit(); } catch (e) {}
+                this._pendingProcesses.delete(name);
+            }
+        }
+
+        for (const entry of this._interfacesList) {
+            if (entry.publicIp === null || entry.publicIp === '...') {
+                this._fetchPublicIpForInterface(entry);
+            }
+        }
+    }
+
+    _fetchPublicIpForInterface(entry) {
+        if (this._pendingProcesses.has(entry.name)) {
+            try { this._pendingProcesses.get(entry.name).force_exit(); } catch (e) {}
+            this._pendingProcesses.delete(entry.name);
+        }
+
+        entry.publicIp = '...';
+        this._updateDisplay();
+
+        const proc = new Gio.Subprocess({
+            argv: [
+                'curl',
+                '--silent',
+                '--max-time', '5',
+                '--connect-timeout', '3',
+                '--interface', entry.name,
+                'https://api.ipify.org?format=json'
+            ],
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        });
+
+        try {
+            proc.init(null);
+            this._pendingProcesses.set(entry.name, proc);
+            
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                this._pendingProcesses.delete(entry.name);
+                
+                const currentEntry = this._interfacesList.find(e => e.name === entry.name);
+                if (!currentEntry) return;
+
+                try {
+                    const [success, stdout] = proc.communicate_utf8_finish(res);
+                    const exitStatus = proc.get_exit_status();
+                    
+                    if (success && exitStatus === 0 && stdout) {
+                        const json = JSON.parse(stdout.trim());
+                        if (json && json.ip) {
+                            currentEntry.publicIp = json.ip;
+                        } else {
+                            throw new Error('Invalid response');
+                        }
+                    } else {
+                        currentEntry.publicIp = '—';
+                    }
+                } catch (e) {
+                    currentEntry.publicIp = '—';
+                }
+                
+                this._updateDisplay();
+            });
+        } catch (e) {
+            console.log(`[IP Indicator] Failed to spawn curl for ${entry.name}: ${e}`);
+            entry.publicIp = '—';
+            this._updateDisplay();
+        }
+    }
+
+    _cancelAllPendingProcesses() {
+        for (const [name, proc] of this._pendingProcesses) {
+            try { proc.force_exit(); } catch (e) {}
+        }
+        this._pendingProcesses.clear();
     }
 
     _startRotation() {
         if (this._rotationTimeoutId) {
             GLib.source_remove(this._rotationTimeoutId);
         }
-        // Ciclar a cada 5 segundos
         this._rotationTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
             if (this._interfacesList.length > 1) {
                 this._rotationIndex = (this._rotationIndex + 1) % this._interfacesList.length;
-                this._updateLocalIpDisplay();
+                this._updateDisplay();
             }
             return GLib.SOURCE_CONTINUE;
         });
     }
 
-    _updateLocalIpDisplay() {
+    _updateDisplay() {
         if (this._interfacesList.length === 0) {
-            this._setLocalIpText('Local: 0.0.0.0');
+            // Formato consistente: sem interfaces
+            this._setDisplayText('No active interfaces');
             return;
         }
 
         const current = this._interfacesList[this._rotationIndex % this._interfacesList.length];
+        const publicIp = current.publicIp || '...';
         
-        // Formato unificado: Local: [nome-interface] ip
-        // Exemplos: "Local: [eth0] 192.168.1.10" ou "Local: [eth0.10] 192.168.50.10"
-        this._setLocalIpText(`Local: [${current.name}] ${current.ip}`);
+        const displayText = `[${current.name}] ${current.ip} → ${publicIp}`;
+        
+        this._setDisplayText(displayText);
+    }
+
+    _setDisplayText(newText) {
+        if (newText !== this._lastDisplayText) {
+            this._displayLabel.set_text(newText);
+            this._lastDisplayText = newText;
+        }
     }
 
     disable() {
@@ -213,11 +288,6 @@ export default class IpIndicatorExtension extends Extension {
         if (this._refreshTimeoutId) {
             GLib.source_remove(this._refreshTimeoutId);
             this._refreshTimeoutId = null;
-        }
-        
-        if (this._retryPublicId) {
-            GLib.source_remove(this._retryPublicId);
-            this._retryPublicId = null;
         }
         
         if (this._idleSourceId) {
@@ -235,7 +305,7 @@ export default class IpIndicatorExtension extends Extension {
         }
         this._startupRetryIds = [];
         
-        this._cancelPendingRequest();
+        this._cancelAllPendingProcesses();
         
         for (const [device, signalId] of this._deviceIp4Ids) {
             try { device.disconnect(signalId); } catch (e) {}
@@ -248,17 +318,8 @@ export default class IpIndicatorExtension extends Extension {
             this._nmClient = null;
         }
         
-        if (this._localIpLabel) { this._localIpLabel.destroy(); this._localIpLabel = null; }
-        if (this._separator) { this._separator.destroy(); this._separator = null; }
-        if (this._publicIpLabel) { this._publicIpLabel.destroy(); this._publicIpLabel = null; }
+        if (this._displayLabel) { this._displayLabel.destroy(); this._displayLabel = null; }
         if (this._box) { this._box.destroy(); this._box = null; }
-    }
-
-    _cancelPendingRequest() {
-        if (this._pendingMessage) {
-            try { this._pendingMessage.cancel(); } catch (e) {}
-            this._pendingMessage = null;
-        }
     }
 
     _scheduleRefresh() {
@@ -302,93 +363,13 @@ export default class IpIndicatorExtension extends Extension {
         const state = this._nmClient ? this._nmClient.get_state() : NM.State.UNKNOWN;
         
         if (state !== NM.State.CONNECTED_GLOBAL) {
-            this._cancelPendingRequest();
-            this._cancelRetries();
+            this._cancelAllPendingProcesses();
             this._interfacesList = [];
-            this._setLocalIpText('Local: 0.0.0.0');
-            this._setPublicIpText('Public: 0.0.0.0');
+            // Formato consistente: rede desligada
+            this._setDisplayText('Network disconnected');
             return;
         }
 
         this._rebuildInterfacesList();
-        this._updateLocalIpDisplay();
-        this._updatePublicIp();
-    }
-
-    _cancelRetries() {
-        if (this._retryPublicId) {
-            GLib.source_remove(this._retryPublicId);
-            this._retryPublicId = null;
-        }
-    }
-
-    _setLocalIpText(newText) {
-        if (newText !== this._lastLocalIp) {
-            this._localIpLabel.set_text(newText);
-            this._lastLocalIp = newText;
-        }
-    }
-
-    _setPublicIpText(newText) {
-        if (newText !== this._lastPublicIp) {
-            this._publicIpLabel.set_text(newText);
-            this._lastPublicIp = newText;
-        }
-    }
-
-    _updatePublicIp() {
-        if (this._nmClient && this._nmClient.get_state() !== NM.State.CONNECTED_GLOBAL) {
-            this._setPublicIpText('Public: 0.0.0.0');
-            return;
-        }
-
-        this._cancelPendingRequest();
-        
-        if (this._lastPublicIp === '' || 
-            this._lastPublicIp === 'Public: ...' || 
-            this._lastPublicIp === 'Public: 0.0.0.0') {
-            this._setPublicIpText('Public: ...');
-        }
-
-        const session = new Soup.Session();
-        session.set_timeout(10);
-        
-        this._pendingMessage = Soup.Message.new('GET', 'https://api.ipify.org?format=json');
-        const currentMessage = this._pendingMessage;
-        
-        session.send_and_read_async(currentMessage, GLib.PRIORITY_DEFAULT, null, (session, result) => {
-            if (this._nmClient && this._nmClient.get_state() !== NM.State.CONNECTED_GLOBAL) {
-                this._setPublicIpText('Public: 0.0.0.0');
-                return;
-            }
-
-            try {
-                const bytes = session.send_and_read_finish(result);
-                if (!bytes) throw new Error('No data received');
-                const text = new TextDecoder().decode(bytes.get_data());
-                const json = JSON.parse(text);
-                if (json && json.ip) {
-                    this._setPublicIpText(`Public: ${json.ip}`);
-                } else {
-                    throw new Error('Invalid response');
-                }
-            } catch (e) {
-                if (this._nmClient && 
-                    this._nmClient.get_state() === NM.State.CONNECTED_GLOBAL &&
-                    !this._retryPublicId) {
-                    this._retryPublicId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
-                        this._retryPublicId = null;
-                        this._updatePublicIp();
-                        return GLib.SOURCE_REMOVE;
-                    });
-                } else if (!this._retryPublicId) {
-                    this._setPublicIpText('Public: 0.0.0.0');
-                }
-            } finally {
-                if (this._pendingMessage === currentMessage) {
-                    this._pendingMessage = null;
-                }
-            }
-        });
     }
 }
