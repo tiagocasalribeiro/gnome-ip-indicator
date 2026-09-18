@@ -5,15 +5,22 @@ import Gio from 'gi://Gio';
 import NM from 'gi://NM';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
+import { Config } from './config.js';
 
 export default class IpIndicatorExtension extends Extension {
     enable() {
         this._box = new St.BoxLayout({
             style_class: 'panel-button',
             y_align: Clutter.ActorAlign.CENTER,
-            reactive: false,
-            can_focus: false,
+            reactive: true,
+            can_focus: true,
             x_expand: false
+        });
+
+        // Abrir preferências ao clicar no indicador
+        this._box.connect('button-press-event', () => {
+            this.openPreferences();
+            return Clutter.EVENT_STOP;
         });
 
         this._displayLabel = new St.Label({ 
@@ -43,6 +50,13 @@ export default class IpIndicatorExtension extends Extension {
         this._nmStateId = null;
         this._nmActiveId = null;
         this._timeoutId = null;
+
+        // Carregar configuração e iniciar monitorização para actualizações em tempo real
+        Config.load();
+        Config.startMonitoring(() => {
+            this._rotationIndex = 0;
+            this._rebuildInterfacesList();
+        });
 
         NM.Client.new_async(null, (client, result) => {
             try {
@@ -116,10 +130,16 @@ export default class IpIndicatorExtension extends Extension {
             return;
         }
 
+        const hiddenInterfaces = Config.getHiddenInterfaces();
         const newInterfaces = [];
         const devices = this._nmClient.get_devices() || [];
         
         for (const device of devices) {
+            const ifaceName = device.get_iface();
+            if (!ifaceName) continue;
+            
+            if (hiddenInterfaces.includes(ifaceName)) continue;
+            
             const ip4Config = device.get_ip4_config();
             if (!ip4Config) continue;
             
@@ -128,9 +148,6 @@ export default class IpIndicatorExtension extends Extension {
             
             const ip = addresses[0].get_address();
             if (!ip || ip === '0.0.0.0') continue;
-            
-            const ifaceName = device.get_iface();
-            if (!ifaceName) continue;
             
             const isVlan = device.get_device_type() === NM.DeviceType.VLAN;
             
@@ -172,14 +189,18 @@ export default class IpIndicatorExtension extends Extension {
             }
         }
 
+        const config = Config.load();
+        const connectTimeout = config.publicIpConnectTimeout || 3;
+        const maxTime = config.publicIpTimeout || 5;
+
         for (const entry of this._interfacesList) {
             if (entry.publicIp === null || entry.publicIp === '...') {
-                this._fetchPublicIpForInterface(entry);
+                this._fetchPublicIpForInterface(entry, connectTimeout, maxTime);
             }
         }
     }
 
-    _fetchPublicIpForInterface(entry) {
+    _fetchPublicIpForInterface(entry, connectTimeout, maxTime) {
         if (this._pendingProcesses.has(entry.name)) {
             try { this._pendingProcesses.get(entry.name).force_exit(); } catch (e) {}
             this._pendingProcesses.delete(entry.name);
@@ -192,8 +213,8 @@ export default class IpIndicatorExtension extends Extension {
             argv: [
                 'curl',
                 '--silent',
-                '--max-time', '5',
-                '--connect-timeout', '3',
+                '--max-time', String(maxTime),
+                '--connect-timeout', String(connectTimeout),
                 '--interface', entry.name,
                 'https://api.ipify.org?format=json'
             ],
@@ -248,7 +269,8 @@ export default class IpIndicatorExtension extends Extension {
         if (this._rotationTimeoutId) {
             GLib.source_remove(this._rotationTimeoutId);
         }
-        this._rotationTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
+        const interval = Config.load().rotationInterval || 5;
+        this._rotationTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, interval, () => {
             if (this._interfacesList.length > 1) {
                 this._rotationIndex = (this._rotationIndex + 1) % this._interfacesList.length;
                 this._updateDisplay();
@@ -259,7 +281,6 @@ export default class IpIndicatorExtension extends Extension {
 
     _updateDisplay() {
         if (this._interfacesList.length === 0) {
-            // Formato consistente: sem interfaces
             this._setDisplayText('No active interfaces');
             return;
         }
@@ -280,6 +301,8 @@ export default class IpIndicatorExtension extends Extension {
     }
 
     disable() {
+        Config.stopMonitoring();
+        
         if (this._timeoutId) {
             GLib.source_remove(this._timeoutId);
             this._timeoutId = null;
@@ -365,7 +388,6 @@ export default class IpIndicatorExtension extends Extension {
         if (state !== NM.State.CONNECTED_GLOBAL) {
             this._cancelAllPendingProcesses();
             this._interfacesList = [];
-            // Formato consistente: rede desligada
             this._setDisplayText('Network disconnected');
             return;
         }
